@@ -80,6 +80,8 @@ python execute.py --input model.ossie.yaml --returned returned.ossie.yaml \
   until no row can be dropped, and both results on it. For the `ELSE 0` case in
   apache/ossie-converters #20:
   `authored gives 0, returned gives NULL on 1 row` (`amount 1, status 'other'`).
+- **ENGINE_DEPENDENT**: DIFFERENT under one of the two DuckDB settings below
+  and SAME under the other; the detail names the setting.
 - **NOT_RUN**, with the reason: a vendor dialect, more than one dataset, a
   window function, a subquery or second statement, a parse error, an expression
   DuckDB cannot bind, both sides failing everywhere, or `duckdb` / `sqlglot` not
@@ -91,9 +93,9 @@ Scope is a top-level metric over one dataset, tagged `ANSI_SQL` or
 sqlglot. A table holds the physical columns the dataset's fields reference, and
 each document gets a view applying its own field expressions, so calculated
 fields work. Each group and the empty table run as one aggregate query per
-side: the six M2 metrics take about 0.4 s once DuckDB is loaded. Expressions
-must be a single expression, and DuckDB runs with external access and extension
-loading off and its configuration locked. Numbers match within
+side and per setting: the six M2 metrics take about 0.7 s once DuckDB is
+loaded. Expressions must be a single expression, and DuckDB runs with external
+access and extension loading off and its configuration locked. Numbers match within
 `|a - b| <= 1e-9 * max(|a|, |b|, 1)` (the rule proposed in apache/ossie #632),
 NULL matches NULL and NaN matches NaN; other values must have the same type, so
 TRUE is not 1.
@@ -115,11 +117,15 @@ group and one all-NULL group: NULLs, duplicates, a filter that matches nothing,
 zero denominators, negatives and fractions. A column with no datatype is
 `Decimal`.
 
-Integer division and division by zero are engine-specific. Under DuckDB's
-defaults (checked on 1.5.5) `/` always returns a double and `x / 0` is `inf`
-(`0 / 0` is NaN), so `SUM(a) / COUNT(DISTINCT b)` against
-`SUM(a) / NULLIF(COUNT(DISTINCT b), 0)` is DIFFERENT here, while another engine
-may return NULL or raise. Read a DIFFERENT that involves `/` with that in mind.
+Integer division and division by zero are engine-specific, so each check runs
+twice: under DuckDB's defaults (checked on 1.5.5: `/` always returns a double,
+`x / 0` is `inf`, `0 / 0` is NaN) and with `integer_division = true` and
+`ieee_floating_point_ops = false` (`7 / 2` is 3, `x / 0` is NULL). A verdict
+that changes between the two is ENGINE_DEPENDENT: `SUM(a) / COUNT(DISTINCT b)`
+against `SUM(a) / NULLIF(COUNT(DISTINCT b), 0)` differs only under the defaults,
+`AVG(x)` against `SUM(x) / COUNT(x)` on integers only under integer division.
+If only one setting can run, its verdict is reported with the other's reason.
+An engine that raises on division by zero is not modelled.
 
 Not covered: field-level rewrites, metrics over several datasets or over other
 metrics, dataset-scoped metrics (`datasets[].metrics`), window functions,

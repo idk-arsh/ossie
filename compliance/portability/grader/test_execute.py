@@ -140,20 +140,43 @@ def test_rewrite_proved_cosmetic_is_run_only_on_request():
 
 
 @requires_engine
-def test_nullif_on_a_zero_count_differs_under_duckdb_defaults():
-    # A DuckDB-default result, not an engine-neutral one. Under DuckDB defaults
-    # (checked on 1.5.5) 1 / 0 is inf for integers, decimals and doubles alike, so
-    # the NULLIF guard changes the result where COUNT(DISTINCT ...) is 0. With
-    # ieee_floating_point_ops = false, 1 / 0 is NULL and the two forms agree; an
-    # engine that raises on division by zero fails the authored form instead.
+def test_nullif_on_a_zero_count_depends_on_division_by_zero_semantics():
+    # Under DuckDB defaults (checked on 1.5.5) 1 / 0 is inf for integers, decimals
+    # and doubles alike, so the NULLIF guard changes the result where
+    # COUNT(DISTINCT ...) is 0. With ieee_floating_point_ops = false, 1 / 0 is
+    # NULL and the two forms agree. An engine that raises on division by zero
+    # fails the authored form instead.
     fields = [("a", "Decimal"), ("b", "Integer")]
     finding = _run(
         fields, "SUM(sales.a) / COUNT(DISTINCT sales.b)", "SUM(sales.a) / NULLIF(COUNT(DISTINCT sales.b), 0)"
     )
-    assert finding.outcome == execute.DIFFERENT
+    assert finding.outcome == execute.ENGINE_DEPENDENT
+    assert "only under DuckDB defaults" in finding.detail
     assert finding.rows == [(1, None)]
-    assert finding.authored_result == float("inf")
     assert finding.returned_result is None
+
+
+@requires_engine
+def test_avg_against_sum_over_count_depends_on_integer_division():
+    finding = _run([("x", "Integer")], "AVG(x)", "SUM(x) / COUNT(x)")
+    assert finding.outcome == execute.ENGINE_DEPENDENT
+    assert "only under integer_division" in finding.detail
+
+
+@requires_engine
+def test_a_setting_where_the_check_cannot_run_does_not_hide_the_other():
+    fields = [("a", "Integer"), ("b", "Integer")]
+    # Under the defaults both sides cast inf to INTEGER and fail on one group;
+    # that counts as agreeing, and integer division then tells them apart.
+    authored = "CAST(SUM(a) / COUNT(DISTINCT b) AS INTEGER) + SUM(a) / 2"
+    finding = _run(fields, authored, authored.replace("SUM(a) / 2", "SUM(a) * 1.0 / 2"))
+    assert finding.outcome == execute.ENGINE_DEPENDENT
+    # Under the defaults SUM(a) / 2 is a DOUBLE and & does not bind, so only the
+    # integer-division setting can run; its verdict is reported with the reason.
+    finding = _run(fields, "(SUM(a) / 2) & 1", "CAST(SUM(a) / 2 AS BIGINT) & 1")
+    assert finding.outcome == execute.SAME_ON_TEST_DATA
+    assert "checked only under integer_division" in finding.detail
+    assert "under DuckDB defaults" in finding.detail and "cannot bind the authored expression" in finding.detail
 
 
 @requires_engine

@@ -29,6 +29,8 @@ DuckDB on the same small edge-case data and compares the results:
                      carries a counterexample (the rows of the smallest differing
                      group, shrunk greedily until no single row can be dropped)
                      and the two results on it
+* ENGINE_DEPENDENT   DIFFERENT under one of the two DuckDB settings the check
+                     runs and SAME under the other (x / 0 and integer division)
 * NOT_RUN            the check could not run, with the reason
 
 Scope: metrics in the top-level ``metrics`` list over a single dataset, tagged
@@ -52,6 +54,7 @@ import grade
 
 SAME_ON_TEST_DATA = "SAME_ON_TEST_DATA"
 DIFFERENT = "DIFFERENT"
+ENGINE_DEPENDENT = "ENGINE_DEPENDENT"
 NOT_RUN = "NOT_RUN"
 
 # Numeric results match if |a - b| <= TOLERANCE * max(|a|, |b|, 1).
@@ -65,6 +68,15 @@ LOCKED = {
     "autoload_known_extensions": False,
     "lock_configuration": True,
 }
+# Each check runs under both settings; a verdict that changes between them is
+# ENGINE_DEPENDENT.
+SETTINGS = (
+    ("DuckDB defaults (x / 0 is inf, 7 / 2 is 3.5)", {}),
+    (
+        "integer_division = true, ieee_floating_point_ops = false (x / 0 is NULL, 7 / 2 is 3)",
+        {"integer_division": True, "ieee_floating_point_ops": False},
+    ),
+)
 
 # DuckDB type and default non-NULL test values per Ossie datatype. The first
 # value is the ordinary one a column takes while another column is varied.
@@ -380,9 +392,9 @@ def _show(value):
 class _Runner:
     """One locked DuckDB connection holding every test row and the two views."""
 
-    def __init__(self, duckdb, columns, rows, authored, returned):
+    def __init__(self, duckdb, columns, rows, authored, returned, settings):
         self.duckdb = duckdb
-        self.con = duckdb.connect(config=LOCKED)
+        self.con = duckdb.connect(config={**LOCKED, **settings})
         self.sides = {"authored_view": authored, "returned_view": returned}
         taken = {name.lower() for name in [*columns, *authored.fields, *returned.fields]}
         self.row_id = "_test_row"
@@ -447,7 +459,7 @@ def _describe(pair, row_ids):
 
 
 def _one_pass(name, runner, columns, groups):
-    """The verdict: the empty table first, then each group. NOT_RUN only if both
+    """The verdict under one setting: the empty table first, then each group. NOT_RUN only if both
     sides fail everywhere."""
     row_ids = []
     pair = runner.pair(row_ids)
@@ -467,7 +479,7 @@ def _one_pass(name, runner, columns, groups):
 
 
 def _run(name, duckdb, authored, returned):
-    """Build the test data and run one check."""
+    """Build the test data, run one check under each setting and combine the verdicts."""
     columns = dict(authored.columns)
     for column, datatype in returned.columns.items():
         key = next((k for k in columns if k.lower() == column.lower()), column)
@@ -482,11 +494,27 @@ def _run(name, duckdb, authored, returned):
         groups.append(list(range(len(rows), len(rows) + len(group))))
         rows.extend(group)
 
-    runner = _Runner(duckdb, columns, rows, authored, returned)
-    try:
-        return _one_pass(name, runner, columns, groups)
-    finally:
-        runner.con.close()
+    checks = []
+    for _, settings in SETTINGS:
+        runner = _Runner(duckdb, columns, rows, authored, returned, settings)
+        try:
+            checks.append(_one_pass(name, runner, columns, groups))
+        except NotRunnable as exc:
+            checks.append(Check(name, NOT_RUN, str(exc)))
+        finally:
+            runner.con.close()
+    outcomes = [check.outcome for check in checks]
+    labels = [label for label, _ in SETTINGS]
+    if sorted(outcomes) == [DIFFERENT, SAME_ON_TEST_DATA]:
+        index = outcomes.index(DIFFERENT)
+        checks[index].outcome = ENGINE_DEPENDENT
+        checks[index].detail += f", only under {labels[index]}"
+        return checks[index]
+    if outcomes.count(NOT_RUN) == 1:
+        index, other = (1, 0) if outcomes[0] == NOT_RUN else (0, 1)
+        checks[index].detail += f"; checked only under {labels[index]}; under {labels[other]}: {checks[other].detail}"
+        return checks[index]
+    return checks[0]
 
 
 def _check_metric(name, input_document, returned_document):
